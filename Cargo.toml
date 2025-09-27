@@ -1,6 +1,6 @@
 [package]
 name = "manager_handlers"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 authors = ["Matei Aruxandei <stefmatei22@gmail.com>"]
 description = "A microservice manager implementation that creates HTTP-accessible handlers with configurable replicas. Handlers communicate via an internal bus, enabling collaborative request processing in a distributed architecture."

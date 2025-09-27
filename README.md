@@ -34,7 +34,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-manager_handlers = "0.7.0"
+manager_handlers = "0.7.1"
 async-trait = "0.1"
 ```
 
@@ -52,9 +52,11 @@ use manager_handlers::handler;
 use async_trait::async_trait;
 
 // Define a simple handler using the macro
-handler!(HelloHandler, async |_src, data| {
-    Ok(format!("Hello, {}!", data))
-});
+handler!(HelloHandler, hello;
+    async fn run(&self, _: String, data: String) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { 
+     Ok(format!("Hello, {}!", data))
+    }
+);
 
 #[tokio::main]
 async fn main() {
@@ -175,23 +177,27 @@ For simpler handlers, use the `handler!` macro:
 use manager_handlers::handler;
 
 // Simple handler
-handler!(EchoHandler, async |src, data| {
-    Ok(format!("Echo from {}: {}", src, data))
-});
+handler!(EchoHandler, echo; 
+    async fn run(&self, _: String, data: String) -> Result<String, Box<dyn std::error::Error + Send + Sync>>  {
+      Ok(format!("Echo from {}: {}", src, data))
+    }
+);
 
 // Handler with state access
-handler!(CounterHandler, async |src, _data| {
-    let state = self.get_shared_state();
-    
-    // Increment counter
-    let counter = match state.get(&"counter".to_string()).await {
-        Some(StateType::Int(val)) => val + 1,
-        _ => 1,
-    };
-    
-    state.insert(&"counter".to_string(), StateType::Int(counter)).await;
-    Ok(format!("Counter: {}", counter))
-});
+handler!(CounterHandler, counter;
+   async fn run(&self, _: String, data: String) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+       let state = self.get_shared_state();
+       
+       // Increment counter
+       let counter = match state.get(&"counter".to_string()).await {
+           Some(StateType::Int(val)) => val + 1,
+           _ => 1,
+       };
+       
+       state.insert(&"counter".to_string(), StateType::Int(counter)).await;
+       Ok(format!("Counter: {}", counter))
+   }
+);
 ```
 
 ### Manager Configuration
@@ -239,7 +245,7 @@ Enable distributed pub/sub with Redis:
 
 ```rust
 // Configure Redis URL
-manager.with_redis_url("redis://localhost:6379".to_string());
+manager.with_redis_url(Some("redis://localhost:6379".to_string()));
 
 // In your handler, use Redis pub/sub
 let response = self.publish_redis(
