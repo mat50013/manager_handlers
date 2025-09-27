@@ -34,7 +34,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-manager_handlers = "0.6.1"
+manager_handlers = "0.7.0"
 async-trait = "0.1"
 ```
 
