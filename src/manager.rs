@@ -34,10 +34,17 @@ use tokio::{
     sync::{Mutex, Notify, Semaphore},
 };
 
+enum DataSource {
+    Http(Option<String>),
+    Redis(RequestRedis),
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub(crate) api_key: String,
 }
+
+type RequestError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Manages the lifecycle of the registered handlers, communication lines, and listeners.
 pub struct Manager {
@@ -340,6 +347,74 @@ impl Manager {
     pub async fn add_global_state(&mut self, key: &str, state_type: StateType) {
         self.shared_state.insert(&key.to_owned(), state_type).await;
     }
+    /// Runs a `Base` instance with data from `DataSource` and optionally publishes the result.
+    /// - HTTP: parses JSON `{ data, type?, src? }`; `Http(None)` is a no-op.
+    /// - Redis: uses `message`; if `reply_channel` non-empty ⇒ request type `"publish"`.
+    /// - On `"publish"` with a reply target: dispatches via Redis or HTTP pub/sub accordingly.
+    /// - Returns `Ok(())`; errors from JSON parsing or `Base::run` propagate as `RequestError`.
+    /// - `instance_factory`/`Base` must be `Send + Sync`; uses `name` for run/dispatch.
+    async fn run_and_dispatch(
+        instance_factory: Arc<Box<dyn Fn() -> Box<dyn Base + Send + Sync> + Send + Sync>>,
+        communication_line_task: Arc<MultiBus>,
+        name: String,
+        data: DataSource,
+    ) -> Result<(), RequestError> {
+        let (data_for_instance, source_type, request_type, reply_target) = match data {
+            DataSource::Http(Some(data_str)) => {
+                let parsed: Value = serde_json::from_str(&data_str)?;
+                let data = parsed["data"].as_str().unwrap_or("").to_string();
+                let req_type = parsed["type"].as_str().unwrap_or("dispatch").to_string();
+                let src = parsed["src"].as_str().unwrap_or("").to_string();
+                (data, "http".to_owned(), req_type, src)
+            }
+            DataSource::Http(None) => return Ok(()),
+            DataSource::Redis(req) => {
+                let req_type = if req.reply_channel.is_empty() { "dispatch" } else { "publish" }.to_owned();
+                (req.message, "redis".to_owned(), req_type, req.reply_channel)
+            }
+        };
+
+        let instance = instance_factory();
+        let result = instance.run(name.clone(), data_for_instance).await?;
+
+        if request_type == "publish" && !reply_target.is_empty() {
+            match source_type.as_str() {
+                "redis" => instance.dispatch_redis(result, reply_target).await,
+                "http" => pub_sub::dispatch(name, reply_target, result, communication_line_task).await,
+                _ => (),
+            }
+        }
+        Ok(())
+    }
+    /// Processes a single handler task: runs `Manager::run_and_dispatch` and logs errors.
+    /// After completion, re-queues this handler by pushing `id` into `standby_handlers_task`.
+    /// Notifies any waiters via `notification_task` so new work can be picked up.
+    /// Uses `instance_factory` to create a `Base` instance; `communication_line_task` for dispatch.
+    /// Thread-safe via `Arc<Mutex<...>>` and async-aware primitives; non-panicking on run errors.
+    /// Intended to be awaited per handler invocation (fire-and-forget callers should spawn it).
+    async fn process_handler_call(
+        id: i32,
+        name: String,
+        data: DataSource,
+        standby_handlers_task: Arc<Mutex<Vec<i32>>>,
+        communication_line_task: Arc<MultiBus>,
+        instance_factory: Arc<Box<dyn Fn() -> Box<dyn Base + Send + Sync> + Send + Sync>>,
+        notification_task: Arc<Notify>,
+    ) {
+        if let Err(e) = Manager::run_and_dispatch(instance_factory, communication_line_task, name, data).await {
+            eprintln!("Error processing request: {}", e);
+        }
+        let mut standby_handlers_lock = standby_handlers_task.lock().await;
+        standby_handlers_lock.push(id);
+        drop(standby_handlers_lock);
+        notification_task.notify_waiters();
+    }
+    /// Initializes per-instance listeners and spawns a supervisor task for each `name`.
+    /// - Calls `pub_sub::setup_publishing` and then loops, multiplexing HTTP vs Redis via `select!`.
+    /// - Maintains a pool of standby handler IDs (`0..number_replicas[name]`) with `Mutex<Vec<i32>>`.
+    /// - On each incoming request, reserves an ID, then spawns `process_handler_call`.
+    /// - Completed handlers re-queue their ID and wake waiters via `Notify`.
+    /// - Pushes each supervisor `JoinHandle` into `self.listeners` for lifecycle management.
     async fn initialize_handlers(&mut self) {
         for (name, instance) in self.instance.iter() {
             pub_sub::setup_publishing(name.clone(), self.communication_line.clone()).await;
@@ -349,88 +424,107 @@ impl Manager {
             let name = name.clone();
 
             let handle = spawn(async move {
-                let nr_times_cn = nr_times.clone().to_owned();
-                let communication_line_clone_2 = communication_line.clone();
-                let standby_handlers: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new((0..nr_times_cn).collect()));
+                let standby_handlers: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new((0..nr_times).collect()));
                 let notification = Arc::new(Notify::new());
-                let name_cn = name.clone();
                 loop {
-                    enum From {
-                        Http(Option<String>),
-                        Redis(RequestRedis),
-                    }
-                    let instance_to_run_redis = instance_to_run.clone()();
-                    let redis_url_state = instance_to_run_redis.get_shared_state().get(&"redis_url".to_owned()).await;
+                    let temp_instance = instance_to_run();
+                    let redis_url_state = temp_instance.get_shared_state().get(&"redis_url".to_owned()).await;
                     let redis_is_configured = matches!(redis_url_state, StateType::String(url) if !url.is_empty());
                     let from_redis: Pin<Box<dyn Future<Output = Result<RequestRedis, _>> + Send>> =
-                        if redis_is_configured { Box::pin(instance_to_run_redis.subscribe_topic_redis(name.clone())) } else { Box::pin(future::pending()) };
+                        if redis_is_configured { Box::pin(temp_instance.subscribe_topic_redis(name.clone())) } else { Box::pin(future::pending()) };
                     let from_http = communication_line.clone().request_data(name.clone());
                     let data = tokio::select! {
-                        data = from_http => From::Http(data),
-                        data = from_redis => From::Redis(data.unwrap())
+                        data = from_http => DataSource::Http(data),
+                        data = from_redis => DataSource::Redis(data.unwrap())
                     };
 
-                    let parsed_data_type;
-                    let parsed_data_src;
-                    let data_for_instance;
-                    let data_type;
-                    match data {
-                        From::Http(data_str) => {
-                            data_type = "http".to_owned();
-                            let parsed_data: Value = serde_json::from_str(&data_str.unwrap()).unwrap();
-                            data_for_instance = parsed_data["data"].as_str().expect("Should have at least an empty string").to_string();
-                            parsed_data_type = parsed_data["type"].as_str().unwrap().to_string();
-                            parsed_data_src = parsed_data["src"].as_str().unwrap().to_string();
-                        }
-                        From::Redis(data_req) => {
-                            data_type = "redis".to_owned();
-                            data_for_instance = data_req.message;
-                            parsed_data_src = data_req.reply_channel;
-                            if parsed_data_src.len() == 0 {
-                                parsed_data_type = "dispatch".to_owned();
-                            } else {
-                                parsed_data_type = "publish".to_owned();
-                            }
-                        }
-                    }
+                    let standby_handlers_task = standby_handlers.clone();
 
-                    let standby_handlers_i = standby_handlers.clone();
-                    let name_cn_i = name_cn.clone();
-                    let communication_line_i = communication_line_clone_2.clone();
-                    let instance_run_i = instance_to_run.clone();
-                    let notification_i = notification.clone();
-
-                    let mut standby_handlers_lock = standby_handlers_i.lock().await;
-                    let mut id = standby_handlers_lock.pop();
-                    drop(standby_handlers_lock);
-                    if id == None {
-                        notification.clone().notified().await;
-                        standby_handlers_lock = standby_handlers_i.lock().await;
-                        id = standby_handlers_lock.pop();
+                    let id = loop {
+                        let mut standby_handlers_lock = standby_handlers_task.lock().await;
+                        if let Some(id) = standby_handlers_lock.pop() {
+                            break id;
+                        }
                         drop(standby_handlers_lock);
-                    }
-                    let id_unwrapped = id.unwrap();
+                        notification.notified().await;
+                    };
+
+                    let name_task = name.clone();
+                    let communication_line_task = communication_line.clone();
+                    let instance_run_task = instance_to_run.clone();
+                    let notification_task = notification.clone();
+
                     spawn(async move {
-                        let result = instance_run_i().run(name_cn_i.clone(), data_for_instance).await;
-                        if let Err(e) = result {
-                            eprintln!("Errored while running handler {}: {}", name_cn_i, e);
-                        } else {
-                            let value_to_return = result.unwrap();
-                            if data_type == "redis" && parsed_data_type == "publish" {
-                                instance_run_i().dispatch_redis(value_to_return.clone(), parsed_data_src.to_string()).await;
-                            } else if data_type == "http" && parsed_data_type == "publish" {
-                                pub_sub::dispatch(name_cn_i.to_string(), parsed_data_src.to_string(), value_to_return, communication_line_i.clone()).await;
-                            }
-                        }
-                        let mut standby_handlers_lock = standby_handlers_i.lock().await;
-                        standby_handlers_lock.push(id_unwrapped);
-                        drop(standby_handlers_lock);
-                        notification_i.notify_waiters();
+                        Manager::process_handler_call(
+                            id,
+                            name_task,
+                            data,
+                            standby_handlers_task,
+                            communication_line_task,
+                            instance_run_task,
+                            notification_task,
+                        )
+                        .await;
                     });
                 }
             });
             self.listeners.push(handle);
         }
+    }
+    /// Builds a `rustls::ServerConfig` from file paths in `self`.
+    /// - Loads server cert chain (`cert_path`) and RSA private key (`key_path`).
+    /// - If `ca_path` is set, enables mTLS with a `RootCertStore` and client cert verification.
+    /// - When `allowed_names` is provided, wraps the default verifier to restrict client subjects.
+    /// - If no `ca_path`, config uses `with_no_client_auth()` (server-only TLS).
+    /// - Returns `None` if cert/key paths are absent; current code `unwrap`s on I/O/parse errors.
+    fn configure_tls_security(&self) -> Option<ServerConfig> {
+        let mut tls_config: Option<ServerConfig> = None;
+
+        if let Some(cert_path) = self.cert_path.clone() {
+            if let Some(key_cert) = self.key_path.clone() {
+                let mut certs_file = BufReader::new(File::open(cert_path).unwrap());
+                let mut key_file = BufReader::new(File::open(key_cert).unwrap());
+                let tls_certs = rustls_pemfile::certs(&mut certs_file).collect::<Result<Vec<_>, _>>().unwrap();
+                let tls_key = rustls_pemfile::rsa_private_keys(&mut key_file).next().unwrap().unwrap();
+
+                if let Some(ca_path) = self.ca_path.clone() {
+                    let mut ca_file = BufReader::new(File::open(ca_path).unwrap());
+                    let ca_certs = rustls_pemfile::certs(&mut ca_file).collect::<Result<Vec<_>, _>>().unwrap();
+                    let mut root_store = RootCertStore::empty();
+                    for cert in ca_certs {
+                        root_store.add(cert).unwrap();
+                    }
+
+                    let mut verifier: Arc<dyn ClientCertVerifier>;
+
+                    let default_verifier = WebPkiClientVerifier::builder(<Arc<RootCertStore>>::from(root_store))
+                        .build()
+                        .expect("Failed to create client certificate verifier");
+
+                    verifier = default_verifier;
+
+                    if let Some(allowed_names) = self.allowed_names.clone() {
+                        let allowed_names_set: HashSet<String> = HashSet::from_iter(allowed_names);
+                        verifier = Arc::new(CustomClientCertVerifier { default_verifier: verifier, allowed_names_set })
+                    }
+
+                    tls_config = Some(
+                        ServerConfig::builder()
+                            .with_client_cert_verifier(verifier)
+                            .with_single_cert(tls_certs, rustls::pki_types::PrivateKeyDer::Pkcs1(tls_key))
+                            .unwrap(),
+                    );
+                } else {
+                    tls_config = Some(
+                        ServerConfig::builder()
+                            .with_no_client_auth()
+                            .with_single_cert(tls_certs, rustls::pki_types::PrivateKeyDer::Pkcs1(tls_key))
+                            .unwrap(),
+                    )
+                }
+            }
+        }
+        tls_config
     }
     /// Starts the manager, initializes the handlers, and launches the Rocket server.
     ///
@@ -449,52 +543,7 @@ impl Manager {
 
             rustls::crypto::aws_lc_rs::default_provider().install_default().unwrap();
 
-            let mut tls_config: Option<ServerConfig> = None;
-
-            if let Some(cert_path) = self.cert_path.clone() {
-                if let Some(key_cert) = self.key_path.clone() {
-                    let mut certs_file = BufReader::new(File::open(cert_path).unwrap());
-                    let mut key_file = BufReader::new(File::open(key_cert).unwrap());
-                    let tls_certs = rustls_pemfile::certs(&mut certs_file).collect::<Result<Vec<_>, _>>().unwrap();
-                    let tls_key = rustls_pemfile::rsa_private_keys(&mut key_file).next().unwrap().unwrap();
-
-                    if let Some(ca_path) = self.ca_path.clone() {
-                        let mut ca_file = BufReader::new(File::open(ca_path).unwrap());
-                        let ca_certs = rustls_pemfile::certs(&mut ca_file).collect::<Result<Vec<_>, _>>().unwrap();
-                        let mut root_store = RootCertStore::empty();
-                        for cert in ca_certs {
-                            root_store.add(cert).unwrap();
-                        }
-
-                        let mut verifier: Arc<dyn ClientCertVerifier>;
-
-                        let default_verifier = WebPkiClientVerifier::builder(<Arc<RootCertStore>>::from(root_store))
-                            .build()
-                            .expect("Failed to create client certificate verifier");
-
-                        verifier = default_verifier;
-
-                        if let Some(allowed_names) = self.allowed_names.clone() {
-                            let allowed_names_set: HashSet<String> = HashSet::from_iter(allowed_names);
-                            verifier = Arc::new(CustomClientCertVerifier { default_verifier: verifier, allowed_names_set })
-                        }
-
-                        tls_config = Some(
-                            ServerConfig::builder()
-                                .with_client_cert_verifier(verifier)
-                                .with_single_cert(tls_certs, rustls::pki_types::PrivateKeyDer::Pkcs1(tls_key))
-                                .unwrap(),
-                        );
-                    } else {
-                        tls_config = Some(
-                            ServerConfig::builder()
-                                .with_no_client_auth()
-                                .with_single_cert(tls_certs, rustls::pki_types::PrivateKeyDer::Pkcs1(tls_key))
-                                .unwrap(),
-                        )
-                    }
-                }
-            }
+            let tls_config: Option<ServerConfig> = self.configure_tls_security();
 
             let end_notifier = Arc::new(Notify::new());
             let one_request_at_a_time = Arc::new(Semaphore::new(self.nr_requests as usize));

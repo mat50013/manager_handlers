@@ -54,6 +54,7 @@ pub async fn shutdown_from_http(shutdown_flag: Data<Arc<AtomicBool>>, manager: D
 pub(crate) async fn handle_common_ending(processor: JoinHandle<Result<String, Box<dyn std::error::Error + Send + Sync>>>, manager: Arc<Notify>, str_handler: String) -> HttpResponse {
     tokio::select! {
         result = processor => {
+            #[cfg(feature = "log")]
             println!("Processed a request to handler {}", str_handler);
             match result {
                 Ok(result) => {
@@ -68,6 +69,7 @@ pub(crate) async fn handle_common_ending(processor: JoinHandle<Result<String, Bo
             }
         },
         _ = manager.notified() => {
+            #[cfg(feature = "log")]
             println!("Service is stopped forcefully, request aborted");
             HttpResponse::InternalServerError().json(json!({"status": "Error", "message":  "Service closed forcefully"}))
         }
@@ -102,20 +104,24 @@ pub async fn process_request(
     manager: Data<Arc<Notify>>,
     request_max_per_handler: Data<Arc<HashMap<String, Arc<Semaphore>>>>,
 ) -> impl Responder {
-    let handler_name = path.into_inner();
-    let str_handler = handler_name.to_string();
-    let str_handler_copy = str_handler.clone();
-    let permits_clone = permits.as_ref().clone();
-    let permits_per_handler_clone = request_max_per_handler.as_ref().clone().get(&handler_name).unwrap().clone();
-    let data_str = String::from_utf8_lossy(&payload.to_bytes().await.unwrap()).to_string();
-    let instance_to_run: Arc<Box<dyn Fn() -> Box<dyn Base + Send + Sync> + Send + Sync>> = instance.get(&str_handler_copy).unwrap().clone();
+    let handler_name: String = path.into_inner();
+
+    let permits_arc = permits.get_ref().clone();
+    let per_handler = request_max_per_handler.get_ref().get(&handler_name).expect("per-handler semaphore missing").clone();
+    let instance_factory = instance.get_ref().get(&handler_name).expect("handler instance missing").clone();
+
+    let body_bytes = payload.to_bytes().await.expect("payload read failed");
+    let data_str = match std::str::from_utf8(&body_bytes) {
+        Ok(s) => s.to_owned(),
+        Err(_) => String::from_utf8_lossy(&body_bytes).into_owned(),
+    };
+
+    let task_handler_name = handler_name.clone();
     let processor = tokio::spawn(async move {
-        let permit = permits_clone.clone().acquire_owned().await.unwrap();
-        let permit_handler = permits_per_handler_clone.clone().acquire_owned().await.unwrap();
-        let result = instance_to_run().run(str_handler_copy, data_str).await;
-        drop(permit);
-        drop(permit_handler);
-        result
+        let _global = permits_arc.acquire_owned().await.unwrap();
+        let _local = per_handler.acquire_owned().await.unwrap();
+        instance_factory().run(task_handler_name, data_str).await
     });
-    handle_common_ending(processor, manager.get_ref().clone(), str_handler).await
+
+    handle_common_ending(processor, manager.get_ref().clone(), handler_name).await
 }

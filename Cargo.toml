@@ -1,6 +1,6 @@
 [package]
 name = "manager_handlers"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2024"
 authors = ["Matei Aruxandei <stefmatei22@gmail.com>"]
 description = "A microservice manager implementation that creates HTTP-accessible handlers with configurable replicas. Handlers communicate via an internal bus, enabling collaborative request processing in a distributed architecture."
@@ -31,6 +31,10 @@ x509-parser = "0.17.0"
 serde = { version = "1.0.218", features = ["derive"] }
 uuid = { version = "1.18.1", features = ["v4"] }
 redis = { version = "0.32.5", features = ["tokio-comp", "aio"] }
+
+[features]
+default = []
+log = []
 
 [profile.release]
 opt-level = 3

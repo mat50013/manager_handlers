@@ -43,64 +43,59 @@ pub async fn process_download(
     instance: Data<Arc<HashMap<String, Arc<Box<dyn Fn() -> Box<dyn Base + Send + Sync> + Send + Sync>>>>>,
 ) -> impl Responder {
     let file_id = path.into_inner();
-    let file_id_clone = file_id.clone();
-    let str_handler: String = "download".to_string();
-    let str_handler_copy = str_handler.clone();
-    let permits_clone = permits.get_ref().clone();
-    let permits_per_handler_clone = request_max_per_handler.get_ref().get(&str_handler_copy).unwrap().clone();
-    let instance_to_run: Arc<Box<dyn Fn() -> Box<dyn Base + Send + Sync> + Send + Sync>> = instance.get_ref().get(&str_handler_copy).unwrap().clone();
-    let processor = tokio::spawn(async move {
-        let permit = permits_clone.clone().acquire_owned().await.unwrap();
-        let permit_handler = permits_per_handler_clone.clone().acquire_owned().await.unwrap();
-        let result = instance_to_run().run_file(str_handler_copy, file_id_clone).await;
-        drop(permit);
-        drop(permit_handler);
-        result
+    const HANDLER: &str = "download";
+
+    let permits_arc = permits.get_ref().clone();
+    let per_handler = request_max_per_handler.get_ref().get(HANDLER).expect("handler semaphore missing").clone();
+    let instance_factory = instance.get_ref().get(HANDLER).expect("handler instance missing").clone();
+
+    let handler_name = HANDLER.to_owned();
+    let processor = spawn(async move {
+        let _global = permits_arc.acquire_owned().await.unwrap();
+        let _local = per_handler.acquire_owned().await.unwrap();
+        instance_factory().run_file(handler_name, file_id).await
     });
+
     tokio::select! {
         result = processor => {
-            println!("Processed a request to handler {}", str_handler);
+            #[cfg(feature = "log")]
+            println!("Processed a request to handler {}", HANDLER);
+
             match result {
-                Ok(result) => {
-                    match result {
-                        Ok((mut source, _)) => {
-                            let response_stream = stream! {
-                                let mut buffer = vec![0; 128 * 1024];
-                                loop {
-                                    match source.read(&mut buffer).await {
-                                        Ok(0) => break,
-                                        Ok(n) => yield Ok(Bytes::copy_from_slice(&buffer[0..n])),
-                                        Err(e) => yield Err(e)
-                                    }
-                                }
-                            };
-                            HttpResponse::Ok().streaming(response_stream)
-                        },
-                        Err(e) => {
-                            let error_body = json!({
-                                "status": "Error",
-                                "message": e.to_string()
-                            }).to_string();
-                            HttpResponse::InternalServerError().json(error_body)
-                        },
-                    }
+                Ok(Ok((mut source, _meta))) => {
+                    let response_stream = stream! {
+                        let mut buffer = vec![0; 128 * 1024];
+                        loop {
+                            match source.read(&mut buffer).await {
+                                Ok(0) => break,
+                                Ok(n) => yield Ok(Bytes::copy_from_slice(&buffer[..n])),
+                                Err(e) => yield Err(e),
+                            }
+                        }
+                    };
+                    HttpResponse::Ok().streaming(response_stream)
                 }
-                Err(e) => {
-                     let error_body = json!({
+                Ok(Err(e)) => {
+                    HttpResponse::InternalServerError().json(json!({
                         "status": "Error",
                         "message": e.to_string()
-                    }).to_string();
-                    HttpResponse::BadRequest().json(error_body)
+                    }))
+                }
+                Err(e) => {
+                    HttpResponse::BadRequest().json(json!({
+                        "status": "Error",
+                        "message": e.to_string()
+                    }))
                 }
             }
         },
         _ = manager.notified() => {
+            #[cfg(feature = "log")]
             println!("Service is stopped forcefully, request aborted");
-             let error_body = json!({
+            HttpResponse::ServiceUnavailable().json(json!({
                 "status": "Error",
                 "message": "Service closed forcefully"
-            }).to_string();
-            HttpResponse::ServiceUnavailable().json(error_body)
+            }))
         }
     }
 }
@@ -138,63 +133,60 @@ pub async fn process_upload(
     request_max_per_handler: Data<Arc<HashMap<String, Arc<Semaphore>>>>,
 ) -> impl Responder {
     let file_name = path.into_inner();
-    let approx_size: usize;
-    if let Some(limit) = req.headers().get("approximate-size") {
-        approx_size = limit.to_str().unwrap().parse::<usize>().unwrap();
-    } else {
+    let approx_size = match req.headers().get("approximate-size") {
+        Some(limit) => limit.to_str().ok().and_then(|s| s.parse::<usize>().ok()),
+        None => None,
+    };
+    if approx_size.is_none() {
         return HttpResponse::BadRequest().json(json!({"status": "Error", "message": "Upload request requires the Approximate-Size header"}));
     }
-    let str_handler = "upload".to_string();
-    let str_handler_copy = str_handler.clone();
-    let permits_clone = permits.get_ref().clone();
-    let permits_per_handler_clone = request_max_per_handler.get_ref().clone().get(&str_handler_copy).unwrap().clone();
+    let approx_size = approx_size.unwrap();
+
+    const HANDLER: &str = "upload";
+    let permits_arc = permits.get_ref().clone();
+    let per_handler = request_max_per_handler.get_ref().get(HANDLER).expect("handler semaphore missing").clone();
+    let instance_factory = instance.get_ref().get(HANDLER).expect("handler instance missing").clone();
 
     let (tx, rx) = mpsc::channel::<Bytes>(64);
-    let instance_to_run: Arc<Box<dyn Fn() -> Box<dyn Base + Send + Sync> + Send + Sync>> = instance.get_ref().get(&str_handler_copy).unwrap().clone();
+
+    let handler_name = HANDLER.to_owned();
     let processor = spawn(async move {
-        let permit = permits_clone.clone().acquire_owned().await.unwrap();
-        let permit_handler = permits_per_handler_clone.clone().acquire_owned().await.unwrap();
-        let mut stream_from_channel = ReceiverStream::new(rx);
-        let result = instance_to_run()
-            .run_stream(
-                str_handler_copy,
-                Box::pin(stream! {
-                    while let Some(chunk) = stream_from_channel.next().await {
-                        yield chunk;
-                    }
-                }),
-                file_name,
-                approx_size,
-            )
-            .await;
-        drop(permit);
-        drop(permit_handler);
-        result
+        let _global = permits_arc.acquire_owned().await.unwrap();
+        let _local = per_handler.acquire_owned().await.unwrap();
+
+        let stream_from_channel = ReceiverStream::new(rx).map(|chunk| chunk);
+        instance_factory()
+            .run_stream(handler_name, Box::pin(stream_from_channel), file_name, approx_size)
+            .await
     });
 
     loop {
         match timeout(Duration::from_secs(20), payload.next()).await {
-            Ok(None) => {
-                break;
-            }
+            Ok(None) => break,
             Ok(Some(Ok(chunk))) => {
-                if tx.send(chunk.clone()).await.is_err() {
+                if tx.send(chunk).await.is_err() {
                     break;
                 }
             }
             Ok(Some(Err(e))) => {
+                #[cfg(feature = "log")]
                 eprintln!("Error reading stream: {}", e);
                 break;
             }
             Err(_) => {
+                #[cfg(feature = "log")]
                 eprintln!("Stream read timed out after 20 seconds");
                 drop(tx);
-                return HttpResponse::RequestTimeout().json(json!({"status": "Error", "message": "Stream read timed out"}));
+                return HttpResponse::RequestTimeout().json(json!({
+                    "status": "Error",
+                    "message": "Stream read timed out"
+                }));
             }
         }
     }
+
     drop(tx);
-    handle_common_ending(processor, manager.get_ref().clone(), str_handler).await
+    handle_common_ending(processor, manager.get_ref().clone(), HANDLER.to_owned()).await
 }
 
 /// Handles requests to retrieve metadata for a specific file.
@@ -222,18 +214,18 @@ pub async fn process_metadata(
     request_max_per_handler: Data<Arc<HashMap<String, Arc<Semaphore>>>>,
 ) -> impl Responder {
     let file_id = path.into_inner();
-    let str_handler: String = "metadata".to_string();
-    let str_handler_copy = str_handler.clone();
-    let permits_clone = permits.get_ref().clone();
-    let permits_per_handler_clone = request_max_per_handler.get_ref().clone().get(&str_handler_copy).unwrap().clone();
-    let instance_to_run: Arc<Box<dyn Fn() -> Box<dyn Base + Send + Sync> + Send + Sync>> = instance.get_ref().get(&str_handler_copy).unwrap().clone();
+    const HANDLER: &str = "metadata";
+
+    let permits_arc = permits.get_ref().clone();
+    let per_handler = request_max_per_handler.get_ref().get(HANDLER).expect("handler semaphore missing").clone();
+    let instance_factory = instance.get_ref().get(HANDLER).expect("handler instance missing").clone();
+
+    let handler_name = HANDLER.to_owned();
     let processor = spawn(async move {
-        let permit = permits_clone.clone().acquire_owned().await.unwrap();
-        let permit_handler = permits_per_handler_clone.clone().acquire_owned().await.unwrap();
-        let result = instance_to_run().run_metadata(str_handler_copy, file_id).await;
-        drop(permit);
-        drop(permit_handler);
-        result
+        let _global = permits_arc.acquire_owned().await.unwrap();
+        let _local = per_handler.acquire_owned().await.unwrap();
+        instance_factory().run_metadata(handler_name, file_id).await
     });
-    handle_common_ending(processor, manager.get_ref().clone(), str_handler).await
+
+    handle_common_ending(processor, manager.get_ref().clone(), HANDLER.to_owned()).await
 }
